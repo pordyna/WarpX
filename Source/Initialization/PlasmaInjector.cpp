@@ -467,10 +467,18 @@ void PlasmaInjector::setupExternalFile (amrex::ParmParse const& pp_species)
             "External file should contain only 1 iteration\n");
         openPMD::Iteration it = m_openpmd_input_series->iterations.begin()->second;
         WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-            it.particles.size() == 1u,
-            "External file should contain only 1 species\n");
-        std::string const ps_name = it.particles.begin()->first;
+            it.particles.size() >= 0u,
+            "No particles present in the series!\n");
+        std::string ps_name = it.particles.begin()->first;
         openPMD::ParticleSpecies ps = it.particles.begin()->second;
+        
+        if (it.particles.size() > 1) {
+            WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+            it.particles.contains(species_name),
+            "External file should contain a spacies with the same name as the injected species or only 1 species.\n");
+            ps = it.particles[species_name];
+            ps_name = species_name;
+        }
 
         charge_from_source = ps.contains("charge");
         mass_from_source = ps.contains("mass");
