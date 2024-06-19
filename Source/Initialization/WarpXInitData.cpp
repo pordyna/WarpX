@@ -1497,8 +1497,11 @@ WarpX::LoadExternalFields (int const lev)
 #endif
     }
 }
+// // TODO: remove this!!!!
+// #define WARPX_USE_OPENPMD
+// #define WARPX_DIM_XZ
 
-#if defined(WARPX_USE_OPENPMD) && !defined(WARPX_DIM_1D_Z) && !defined(WARPX_DIM_XZ)
+#if defined(WARPX_USE_OPENPMD) && !defined(WARPX_DIM_1D_Z) // && !defined(WARPX_DIM_XZ)
 void
 WarpX::ReadExternalFieldFromFile (
        const std::string& read_fields_from_path, amrex::MultiFab* mf,
@@ -1528,8 +1531,8 @@ WarpX::ReadExternalFieldFromFile (
                                      "3D expects axisLabels {x, y, z}");
 #elif defined(WARPX_DIM_XZ)
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(fileGeom == "cartesian", "XZ can only read from files with cartesian geometry");
-    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(axisLabels[0] == "x" && axisLabels[1] == "z",
-                                     "XZ expects axisLabels {x, z}");
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE((axisLabels.size() == 2) && (axisLabels[0] == "z" && axisLabels[1] == "x"),
+                                     "XZ expects axisLabels {z, x}");
 #elif defined(WARPX_DIM_1D_Z)
     WARPX_ABORT_WITH_MESSAGE(
         "Reading from openPMD for external fields is not known to work with 1D3V (see #3830)");
@@ -1552,6 +1555,9 @@ WarpX::ReadExternalFieldFromFile (
 #if defined(WARPX_DIM_RZ)
     const auto file_dr = static_cast<amrex::Real>(d[0]);
     const auto file_dz = static_cast<amrex::Real>(d[1]);
+#elif defined(WARPX_DIM_XZ)
+    const auto file_dx = static_cast<amrex::Real>(d[1]);
+    const auto file_dz = static_cast<amrex::Real>(d[0]);
 #elif defined(WARPX_DIM_3D)
     const auto file_dx = static_cast<amrex::Real>(d[0]);
     const auto file_dy = static_cast<amrex::Real>(d[1]);
@@ -1562,21 +1568,33 @@ WarpX::ReadExternalFieldFromFile (
     const auto extent = FC.getExtent();
     const auto extent0 = static_cast<int>(extent[0]);
     const auto extent1 = static_cast<int>(extent[1]);
+    #if defined(WARPX_DIM_3D) || defined(WARPX_DIM_RZ)
     const auto extent2 = static_cast<int>(extent[2]);
+    #endif
 
     // Determine the chunk data that will be loaded.
     // Now, the full range of data is loaded.
     // Loading chunk data can speed up the process.
     // Thus, `chunk_offset` and `chunk_extent` should be modified accordingly in another PR.
+    #if defined(WARPX_DIM_3D)
     const openPMD::Offset chunk_offset = {0,0,0};
     const openPMD::Extent chunk_extent = {extent[0], extent[1], extent[2]};
+    #else
+    const openPMD::Offset chunk_offset = {0,0};
+    const openPMD::Extent chunk_extent = {extent[0], extent[1]};
+    #endif
 
     auto FC_chunk_data = FC.loadChunk<double>(chunk_offset,chunk_extent);
     series.flush();
     auto *FC_data_host = FC_chunk_data.get();
 
     // Load data to GPU
+    #if defined(WARPX_DIM_3D) || defined(WARPX_DIM_RZ)
     const size_t total_extent = size_t(extent[0]) * extent[1] * extent[2];
+    #else
+    const size_t total_extent = size_t(extent[0]) * extent[1];
+    #endif
+
     amrex::Gpu::DeviceVector<double> FC_data_gpu(total_extent);
     auto *FC_data = FC_data_gpu.data();
     amrex::Gpu::copy(amrex::Gpu::hostToDevice, FC_data_host, FC_data_host + total_extent, FC_data);
@@ -1607,6 +1625,7 @@ WarpX::ReadExternalFieldFromFile (
                 // Physical coordinates of the grid point
                 // 0,1,2 denote x,y,z in 3D xyz.
                 // 0,1 denote r,z in 2D rz.
+                // 0,1 denote x,z in 2D xz.
                 amrex::Real x0, x1;
                 if ( box.type(0)==amrex::IndexType::CellIndex::NODE )
                      { x0 = static_cast<amrex::Real>(real_box.lo(0)) + ii*dx[0]; }
@@ -1623,6 +1642,15 @@ WarpX::ReadExternalFieldFromFile (
                 // Get coordinates of external grid point
                 amrex::Real const xx0 = offset0 + ir * file_dr;
                 amrex::Real const xx1 = offset1 + iz * file_dz;
+
+#elif defined(WARPX_DIM_XZ)
+                // Get index of the external field array
+                int const ix = std::floor( (x0-offset1)/file_dx );
+                int const iz = std::floor( (x1-offset0)/file_dz );
+
+                // Get coordinates of external grid point
+                amrex::Real const xx0 = offset1 + ix * file_dx;
+                amrex::Real const xx1 = offset0 + iz * file_dz;
 
 #elif defined(WARPX_DIM_3D)
                 amrex::Real x2;
@@ -1652,6 +1680,19 @@ WarpX::ReadExternalFieldFromFile (
                     (xx0, xx0+file_dr, xx1, xx1+file_dz,
                      f00, f01, f10, f11,
                      x0, x1));
+#elif defined(WARPX_DIM_XZ)
+                const amrex::Array4<double> fc_array(FC_data, {0,0,0}, {1, extent1, extent0}, 1);
+                // amrex data is in F-order so the indices are reversed, but we also reverse the
+                // read order so that it fits z, x in C-order in openpmd so that it becomes not reversed xz.
+                const double
+                    f00 = fc_array(0, ix  , iz  ),
+                    f01 = fc_array(0, ix  , iz+1),
+                    f10 = fc_array(0, ix+1, iz  ),
+                    f11 = fc_array(0, ix+1, iz+1);
+                mffab(i,j,k) = static_cast<amrex::Real>(utils::algorithms::bilinear_interp<double>
+                    (xx0, xx0+file_dx, xx1, xx1+file_dz,
+                     f00, f01, f10, f11,
+                     x0, x1));
 #elif defined(WARPX_DIM_3D)
                 const amrex::Array4<double> fc_array(FC_data, {0,0,0}, {extent2, extent1, extent0}, 1);
                 const double
@@ -1668,7 +1709,6 @@ WarpX::ReadExternalFieldFromFile (
                      f000, f001, f010, f011, f100, f101, f110, f111,
                      x0, x1, x2));
 #endif
-
             }
 
         ); // End ParallelFor
